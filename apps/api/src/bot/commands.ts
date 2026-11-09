@@ -4,9 +4,10 @@ import { TaskService } from '../services/taskService';
 import { StatsService } from '../services/statsService';
 import { ChartService } from '../services/chartService';
 import { FinanceService } from '../services/financeService';
+import { formatInTashkent } from '../services/schedulerService';
 import { prisma } from '../app';
 import { TaskPriority, TaskStatus } from '@prisma/client';
-import { addMinutes, format, isValid, parse, parseISO } from 'date-fns';
+import { addMinutes, format } from 'date-fns';
 
 // Extract user ID helper
 const getUserId = async (ctx: Context) => {
@@ -51,7 +52,7 @@ bot.command('today', async (ctx) => {
     if (tasks.length === 0) msg += `(Rejalashtirilgan ishlar yo‘q)\n`;
 
     tasks.forEach((t: any) => {
-        const time = t.startAt ? format(t.startAt, 'HH:mm') : '??:??';
+        const time = t.startAt ? formatInTashkent(t.startAt) : '??:??';
         const icon = t.status === TaskStatus.DONE ? '✅' : t.priority === TaskPriority.IMPORTANT ? '🔴' : t.priority === TaskPriority.NORMAL ? '🟠' : '🔵';
         msg += `${icon} ${time} - ${t.title} (${t.durationMinutes}m)\n`;
     });
@@ -98,7 +99,7 @@ bot.command('add', async (ctx) => {
     ctx.reply(`✅ Vazifa qo‘shildi: "${text}"`);
 });
 
-// /done <id> (simplified for now, maybe interactive later)
+// /help
 bot.command('help', (ctx) => {
     ctx.reply(
         `🤖 **Personal Planner Bot**\n\n` +
@@ -114,25 +115,11 @@ bot.command('help', (ctx) => {
     );
 });
 
-
-
-// /done <taskId> (Simplified: /done last or select via UI? For now user implementation requested command line. Let's list pending tasks with buttons?)
-// User requested "/done <taskId>", but knowing ID is hard. Let's make /today return IDs or use buttons.
-// Let's implement /done as interactive or simple list.
+// /done
 bot.command('done', async (ctx) => {
-    // Check if args
     const userId = await getUserId(ctx);
     if (!userId) return ctx.reply('Auth required.');
 
-    const parts = (ctx.message as any).text.split(' ');
-    if (parts.length > 1) {
-        // ID provided (maybe partial?) - Realistically full CUID is hard to type.
-        // Let's assume they might copy paste or we give a short ID?
-        // Let's just create a "Select Task to Done" menu.
-        return ctx.reply('Task ID topilmadi. Iltimos tugmalardan foydalaning (soon).');
-    }
-
-    // Show List of TODAY's TODO tasks with Inline Buttons
     const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
     const endOfToday = new Date(); endOfToday.setHours(23, 59, 59, 999);
 
@@ -153,8 +140,240 @@ bot.action(/done:(.+)/, async (ctx) => {
         where: { id: taskId },
         data: { status: TaskStatus.DONE }
     });
+    // Immediately stop reminder
+    await prisma.reminderSettings.updateMany({
+        where: { taskId },
+        data: { isEnabled: false, nextReminderAt: null }
+    });
     ctx.answerCbQuery('Task bajarildi!');
     ctx.editMessageText('✅ Task DONE qilindi.');
+});
+
+// --- Section 4: Telegram Reminder Inline Buttons Handlers ---
+
+const getOpenTaskButton = (taskId: string) => {
+    const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
+    const isRealHttpUrl = appBaseUrl.startsWith('https://') && !appBaseUrl.includes('localhost') && !appBaseUrl.includes('127.0.0.1');
+    return isRealHttpUrl
+        ? Markup.button.url('📋 Vazifani ochish', `${appBaseUrl}/dashboard/tasks?id=${taskId}`)
+        : Markup.button.callback('📋 Vazifani ochish', `reminder:open:${taskId}`);
+};
+
+// 1. Mark as completed
+bot.action(/^reminder:done:(.+)$/, async (ctx) => {
+    try {
+        const taskId = ctx.match[1];
+        const task = await prisma.task.findUnique({
+            where: { id: taskId }
+        });
+        if (!task) {
+            await ctx.answerCbQuery('Vazifa topilmadi');
+            return;
+        }
+
+        await prisma.task.update({
+            where: { id: taskId },
+            data: { status: TaskStatus.DONE }
+        });
+        await prisma.reminderSettings.updateMany({
+            where: { taskId },
+            data: { isEnabled: false, nextReminderAt: null }
+        });
+
+        await ctx.answerCbQuery('✅ Vazifa bajarildi!');
+        await ctx.editMessageText(
+            `✅ **Vazifa muvaffaqiyatli bajarildi!**\n\n` +
+            `📋 **${task.title}**\n` +
+            `Kelgusi barcha eslatmalar to‘xtatildi.`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (e) {
+        console.error('reminder:done error:', e);
+        ctx.answerCbQuery('Xatolik yuz berdi');
+    }
+});
+
+// 2. Snooze (20 min or 60 min or custom)
+// "The snooze button must temporarily override the next reminder time without permanently changing the task's configured interval."
+bot.action(/^reminder:snooze:(\d+):(.+)$/, async (ctx) => {
+    try {
+        const minutes = parseInt(ctx.match[1]);
+        const taskId = ctx.match[2];
+
+        const task = await prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
+        });
+
+        if (!task || !task.reminder) {
+            await ctx.answerCbQuery('Eslatma topilmadi');
+            return;
+        }
+
+        const now = new Date();
+        const snoozeTarget = addMinutes(now, minutes);
+
+        await prisma.reminderSettings.update({
+            where: { id: task.reminder.id },
+            data: {
+                snoozedUntil: snoozeTarget,
+                nextReminderAt: snoozeTarget,
+                isEnabled: true,
+                isPaused: false
+            }
+        });
+
+        const formattedTarget = formatInTashkent(snoozeTarget);
+        await ctx.answerCbQuery(`⏰ ${minutes} daqiqaga kechiktirildi`);
+
+        const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
+        await ctx.editMessageText(
+            `⏰ **Eslatma ${minutes} daqiqaga kechiktirildi.**\n\n` +
+            `📋 **Vazifa**: ${task.title}\n` +
+            `🕒 **Keyingi eslatma**: ${formattedTarget} da yuboriladi.\n` +
+            `_(Asosiy sozlangan interval o‘zgarishsiz qoldi: Har ${task.reminder.intervalMinutes || 20} daqiqada)_`,
+            {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('✅ Bajarildi deb belgilash', `reminder:done:${task.id}`)
+                    ],
+                    [
+                        Markup.button.callback('⏰ +20 daqiqa', `reminder:snooze:20:${task.id}`),
+                        Markup.button.callback('⏰ +1 soat', `reminder:snooze:60:${task.id}`)
+                    ],
+                    [
+                        Markup.button.callback('⏸ Eslatmani pauza qilish', `reminder:pause:${task.id}`),
+                        getOpenTaskButton(task.id)
+                    ]
+                ])
+            }
+        );
+    } catch (e) {
+        console.error('reminder:snooze error:', e);
+        ctx.answerCbQuery('Xatolik yuz berdi');
+    }
+});
+
+// 3. Pause reminders
+bot.action(/^reminder:pause:(.+)$/, async (ctx) => {
+    try {
+        const taskId = ctx.match[1];
+        const task = await prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
+        });
+
+        if (!task || !task.reminder) {
+            await ctx.answerCbQuery('Eslatma topilmadi');
+            return;
+        }
+
+        await prisma.reminderSettings.update({
+            where: { id: task.reminder.id },
+            data: { isPaused: true }
+        });
+
+        await ctx.answerCbQuery('⏸ Eslatmalar to‘xtatildi (pauza)');
+
+        await ctx.editMessageText(
+            `⏸ **Eslatmalar vaqtincha to‘xtatildi (Pauza).**\n\n` +
+            `📋 **Vazifa**: ${task.title}\n` +
+            `Istalgan vaqtda quyidagi tugma orqali eslatmalarni qayta davom ettirishingiz mumkin.`,
+            {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('▶️ Qayta davom ettirish (Resume)', `reminder:resume:${task.id}`)
+                    ],
+                    [
+                        Markup.button.callback('✅ Bajarildi deb belgilash', `reminder:done:${task.id}`)
+                    ],
+                    [
+                        getOpenTaskButton(task.id)
+                    ]
+                ])
+            }
+        );
+    } catch (e) {
+        console.error('reminder:pause error:', e);
+        ctx.answerCbQuery('Xatolik yuz berdi');
+    }
+});
+
+// 4. Resume reminders
+bot.action(/^reminder:resume:(.+)$/, async (ctx) => {
+    try {
+        const taskId = ctx.match[1];
+        const task = await prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
+        });
+
+        if (!task || !task.reminder) {
+            await ctx.answerCbQuery('Eslatma topilmadi');
+            return;
+        }
+
+        const interval = task.reminder.intervalMinutes || 20;
+        const nextTime = addMinutes(new Date(), interval);
+
+        await prisma.reminderSettings.update({
+            where: { id: task.reminder.id },
+            data: {
+                isPaused: false,
+                isEnabled: true,
+                nextReminderAt: nextTime,
+                snoozedUntil: null
+            }
+        });
+
+        await ctx.answerCbQuery('▶️ Eslatmalar davom ettirildi');
+
+        await ctx.editMessageText(
+            `▶️ **Eslatmalar qayta davom ettirildi!**\n\n` +
+            `📋 **Vazifa**: ${task.title}\n` +
+            `🕒 **Keyingi eslatma**: ${formatInTashkent(nextTime)} da yuboriladi.\n` +
+            `(Interval: Har ${interval} daqiqada)`,
+            {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('✅ Bajarildi deb belgilash', `reminder:done:${task.id}`)
+                    ],
+                    [
+                        Markup.button.callback('⏰ +20 daqiqa', `reminder:snooze:20:${task.id}`),
+                        Markup.button.callback('⏰ +1 soat', `reminder:snooze:60:${task.id}`)
+                    ],
+                    [
+                        Markup.button.callback('⏸ Eslatmani pauza qilish', `reminder:pause:${task.id}`),
+                        getOpenTaskButton(task.id)
+                    ]
+                ])
+            }
+        );
+    } catch (e) {
+        console.error('reminder:resume error:', e);
+        ctx.answerCbQuery('Xatolik yuz berdi');
+    }
+});
+
+// 5. Open task callback
+bot.action(/^reminder:open:(.+)$/, async (ctx) => {
+    try {
+        const taskId = ctx.match[1];
+        const task = await prisma.task.findUnique({ where: { id: taskId } });
+        const appUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
+        await ctx.answerCbQuery();
+        await ctx.reply(
+            `📋 **Vazifa Tafsilotlari**:\n\n` +
+            `Sarlavha: ${task?.title}\n` +
+            `Holati: ${task?.status}\n\n` +
+            `Web-ilovada ochish: ${appUrl}/dashboard/tasks?id=${taskId}`
+        );
+    } catch (e) {
+        console.error('reminder:open error:', e);
+    }
 });
 
 // /chart week
@@ -189,13 +408,7 @@ bot.command('gaps', async (ctx) => {
 });
 
 // --- Menu & Extra Features ---
-
 bot.command('menu', async (ctx) => {
-    const userId = await getUserId(ctx);
-    if (!userId) return ctx.reply('👋 Salom! Men sizning shaxsiy yordamchingizman. Web-sayt bilan bog‘lanish uchun ko‘rsatmalarga amal qiling.', Markup.keyboard([
-        ['📊 Hisobot', '💰 Qolgan mablag‘'],
-        ['📋 Vazifalar', '✅ Topshirilgan']
-    ]).resize());
     return ctx.reply('Asosiy menyu:', Markup.keyboard([
         ['📊 Hisobot', '💰 Qolgan mablag‘'],
         ['📋 Vazifalar', '✅ Topshirilgan']
@@ -275,7 +488,7 @@ bot.hears('📋 Vazifalar', async (ctx) => {
         msg += `(Rejalashtirilgan ishlar yo‘q)`;
     } else {
         tasks.forEach((t: any) => {
-            const time = t.startAt ? format(t.startAt, 'HH:mm') : '??:??';
+            const time = t.startAt ? formatInTashkent(t.startAt) : '??:??';
             const icon = t.status === TaskStatus.DONE ? '✅' : t.priority === TaskPriority.IMPORTANT ? '🔴' : t.priority === TaskPriority.NORMAL ? '🟠' : '🔵';
             msg += `${icon} ${time} - ${t.title} (${t.durationMinutes}m)\n`;
         });
@@ -306,7 +519,7 @@ bot.hears('✅ Topshirilgan', async (ctx) => {
         msg += `(Hali hech narsa bajarilmadi)`;
     } else {
         tasks.forEach((t: any) => {
-            const time = format(t.updatedAt, 'HH:mm');
+            const time = formatInTashkent(t.updatedAt);
             msg += `✅ ${time} - ${t.title}\n`;
         });
     }
@@ -314,8 +527,6 @@ bot.hears('✅ Topshirilgan', async (ctx) => {
     ctx.replyWithMarkdown(msg);
 });
 
-// Export helper to register these in index.ts
 export const registerCommands = () => {
-    // This file is imported in index.ts, so commands are registered on 'bot' imported from there.
     console.log('Bot commands registered');
 };

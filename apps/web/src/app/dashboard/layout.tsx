@@ -3,6 +3,7 @@
 import { AuthProvider, useAuth } from '../../components/AuthProvider';
 import Sidebar from '../../components/Sidebar';
 import Header from '../../components/Header';
+import MobileBottomNav from '../../components/MobileBottomNav';
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 
@@ -34,9 +35,10 @@ function DashboardContent({ children }: { children: React.ReactNode }) {
             <Sidebar />
             <div className="flex flex-1 flex-col overflow-hidden">
                 <Header />
-                <main className="flex-1 overflow-y-auto p-6">
+                <main className="flex-1 overflow-y-auto p-4 sm:p-6 pb-24 md:pb-6">
                     {children}
                 </main>
+                <MobileBottomNav />
             </div>
         </div>
     );

@@ -1,14 +1,17 @@
 "use client";
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api';
 
-interface User {
+export interface User {
     id: string;
     name: string;
     email: string;
+    telegramChatId?: string | null;
+    allowReminders?: boolean;
+    lessonMode?: boolean;
 }
 
 interface AuthContextType {
@@ -17,6 +20,8 @@ interface AuthContextType {
     login: (email: string, password: string) => Promise<void>;
     register: (name: string, email: string, password: string) => Promise<void>;
     logout: () => void;
+    updateUser: (updatedData: Partial<User>) => void;
+    refreshUser: () => Promise<void>;
     loading: boolean;
     error: string | null;
 }
@@ -37,17 +42,48 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const router = useRouter();
     const pathname = usePathname();
 
+    const refreshUser = useCallback(async () => {
+        const savedToken = localStorage.getItem('token');
+        if (!savedToken) return;
+        try {
+            const res = await fetch(`${API_URL}/auth/profile`, {
+                headers: { 'Authorization': `Bearer ${savedToken}` }
+            });
+            if (res.ok) {
+                const freshUser = await res.json();
+                setUser(freshUser);
+                localStorage.setItem('user', JSON.stringify(freshUser));
+            }
+        } catch (e) {
+            console.error('Failed to refresh user profile:', e);
+        }
+    }, []);
+
     useEffect(() => {
         const savedToken = localStorage.getItem('token');
         const savedUser = localStorage.getItem('user');
         if (savedToken && savedUser) {
             setToken(savedToken);
-            setUser(JSON.parse(savedUser));
+            try {
+                setUser(JSON.parse(savedUser));
+            } catch {
+                setUser(null);
+            }
+            refreshUser();
         } else if (pathname?.startsWith('/dashboard')) {
             router.push('/login');
         }
         setLoading(false);
-    }, []);
+    }, [pathname, refreshUser, router]);
+
+    const updateUser = (updatedData: Partial<User>) => {
+        setUser((prev) => {
+            if (!prev) return null;
+            const merged = { ...prev, ...updatedData };
+            localStorage.setItem('user', JSON.stringify(merged));
+            return merged;
+        });
+    };
 
     const login = async (email: string, password: string) => {
         setError(null);
@@ -67,7 +103,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             localStorage.setItem('user', JSON.stringify(data.user));
             setToken(data.token);
             setUser(data.user);
-            router.push('/dashboard');
+            router.push('/dashboard/tasks');
         } catch (err: any) {
             setError(err.message);
         } finally {
@@ -93,7 +129,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             localStorage.setItem('user', JSON.stringify(data.user));
             setToken(data.token);
             setUser(data.user);
-            router.push('/dashboard');
+            router.push('/dashboard/tasks');
         } catch (err: any) {
             setError(err.message);
         } finally {
@@ -110,7 +146,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
 
     return (
-        <AuthContext.Provider value={{ user, token, login, register, logout, loading, error }}>
+        <AuthContext.Provider value={{ user, token, login, register, logout, updateUser, refreshUser, loading, error }}>
             {children}
         </AuthContext.Provider>
     );

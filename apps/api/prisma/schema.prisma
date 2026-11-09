@@ -40,6 +40,13 @@ enum NotificationType {
   FINANCE_MONTHLY
 }
 
+enum ReminderType {
+  NONE
+  ONCE
+  REPEATED
+  CUSTOM
+}
+
 model User {
   id               String   @id @default(cuid())
   name             String
@@ -48,6 +55,8 @@ model User {
   timezone         String   @default("Asia/Tashkent")
   telegramChatId   String?  @unique
   telegramLinkCode String?  @unique
+  allowReminders   Boolean  @default(true) @map("allow_reminders")
+  lessonMode       Boolean  @default(false) @map("lesson_mode")
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
@@ -80,7 +89,31 @@ model Task {
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
+  reminder        ReminderSettings?
   notificationLogs NotificationLog[]
+}
+
+model ReminderSettings {
+  id              String       @id @default(cuid())
+  taskId          String       @unique
+  task            Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  reminderType    ReminderType @default(NONE) @map("reminder_type")
+  intervalMinutes Int?         @map("interval_minutes")
+  firstReminderAt DateTime?    @map("first_reminder_at")
+  nextReminderAt  DateTime?    @map("next_reminder_at")
+  lastReminderAt  DateTime?    @map("last_reminder_at")
+  isEnabled       Boolean      @default(true) @map("is_enabled")
+  isPaused        Boolean      @default(false) @map("is_paused")
+  stopAtDeadline  Boolean      @default(true) @map("stop_at_deadline")
+  maxReminders    Int?         @map("max_reminders")
+  sentCount       Int          @default(0) @map("sent_count")
+  snoozedUntil    DateTime?    @map("snoozed_until")
+
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+
+  @@map("reminder_settings")
 }
 
 model Income {
@@ -118,14 +151,16 @@ model Expense {
 }
 
 model NotificationLog {
-  id        String             @id @default(cuid())
+  id        String              @id @default(cuid())
   userId    String
-  user      User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   taskId    String?
-  task      Task?              @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  task      Task?               @relation(fields: [taskId], references: [id], onDelete: SetNull)
 
   channel   NotificationChannel @default(TELEGRAM)
   type      NotificationType
+  status    String              @default("SENT") // SENT or FAILED
+  error     String?
   sentAt    DateTime            @default(now())
   meta      Json?
 }
@@ -156,4 +191,3 @@ model Event {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
-

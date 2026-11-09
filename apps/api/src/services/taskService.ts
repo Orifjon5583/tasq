@@ -1,54 +1,422 @@
-import { PrismaClient, Task, TaskPriority, TaskStatus } from '@prisma/client';
+import { PrismaClient, Task, TaskPriority, TaskStatus, ReminderType } from '@prisma/client';
 import { prisma } from '../app';
-import { startOfDay, endOfDay, addMinutes, isBefore, isAfter, parseISO } from 'date-fns';
+import { startOfDay, endOfDay, addMinutes, isBefore, isAfter } from 'date-fns';
+
+export interface TaskReminderInput {
+    reminderType: ReminderType;
+    intervalMinutes?: number | null;
+    firstReminderAt?: string | Date | null;
+    nextReminderAt?: string | Date | null;
+    stopAtDeadline?: boolean;
+    maxReminders?: number | null;
+    isEnabled?: boolean;
+    isPaused?: boolean;
+    snoozedUntil?: string | Date | null;
+}
 
 export class TaskService {
     static async create(userId: string, data: {
         title: string;
         description?: string;
-        priority: TaskPriority;
-        durationMinutes: number;
-        startAt?: string; // ISO string
-        dueAt?: string;
+        priority?: TaskPriority;
+        durationMinutes?: number;
+        startAt?: string | Date;
+        dueAt?: string | Date;
+        reminder?: TaskReminderInput;
     }) {
-        // Overlap check if startAt is provided
+        const priority = data.priority || TaskPriority.NORMAL;
+        const durationMinutes = data.durationMinutes || 60;
+        let start: Date | undefined;
+        let end: Date | undefined;
+        let planned = false;
+
         if (data.startAt) {
-            const start = new Date(data.startAt);
-            const end = addMinutes(start, data.durationMinutes);
+            start = new Date(data.startAt);
+            end = addMinutes(start, durationMinutes);
+            planned = true;
 
             const hasOverlap = await this.checkOverlap(userId, start, end);
             if (hasOverlap) {
-                throw new Error('Time slot overlaps with an existing task.');
+                // If overlap exists, log warning but don't strictly crash unless needed
+                console.warn(`Time slot overlaps with existing task for user ${userId}`);
             }
-
-            return prisma.task.create({
-                data: {
-                    userId,
-                    title: data.title,
-                    description: data.description,
-                    priority: data.priority,
-                    durationMinutes: data.durationMinutes,
-                    startAt: start,
-                    endAt: end,
-                    planned: true, // It is planned if it has a start time
-                    dueAt: data.dueAt ? new Date(data.dueAt) : undefined,
-                    status: TaskStatus.TODO
-                }
-            });
         }
 
-        // Backlog task
+        const dueAt = data.dueAt ? new Date(data.dueAt) : undefined;
+
+        // Reminder calculation
+        const reminderInput = data.reminder;
+        let reminderCreateData: any = undefined;
+
+        if (reminderInput && reminderInput.reminderType && reminderInput.reminderType !== ReminderType.NONE) {
+            const reminderType = reminderInput.reminderType;
+            const intervalMinutes = reminderInput.intervalMinutes ?? (reminderType === ReminderType.REPEATED || reminderType === ReminderType.CUSTOM ? 20 : null);
+            
+            let firstReminderDate: Date | null = null;
+            if (reminderInput.firstReminderAt) {
+                firstReminderDate = new Date(reminderInput.firstReminderAt);
+            } else if (start) {
+                firstReminderDate = new Date(start);
+            }
+
+            // Next reminder determination
+            let nextReminderDate: Date | null = null;
+            if (firstReminderDate) {
+                nextReminderDate = new Date(firstReminderDate);
+            } else if (intervalMinutes) {
+                nextReminderDate = addMinutes(new Date(), intervalMinutes);
+            }
+
+            // If stop at deadline and next reminder is already after deadline
+            if (reminderInput.stopAtDeadline && dueAt && nextReminderDate && nextReminderDate > dueAt) {
+                nextReminderDate = null;
+            }
+
+            reminderCreateData = {
+                reminderType,
+                intervalMinutes,
+                firstReminderAt: firstReminderDate,
+                nextReminderAt: nextReminderDate,
+                stopAtDeadline: reminderInput.stopAtDeadline !== false,
+                maxReminders: reminderInput.maxReminders ?? null,
+                isEnabled: nextReminderDate !== null,
+                isPaused: false,
+                sentCount: 0
+            };
+        } else {
+            // Task has default NONE reminder settings so every task has individual reminder settings
+            reminderCreateData = {
+                reminderType: ReminderType.NONE,
+                isEnabled: false,
+                isPaused: false,
+                stopAtDeadline: true,
+                sentCount: 0
+            };
+        }
+
         return prisma.task.create({
             data: {
                 userId,
                 title: data.title,
                 description: data.description,
-                priority: data.priority,
-                durationMinutes: data.durationMinutes,
-                planned: false,
-                dueAt: data.dueAt ? new Date(data.dueAt) : undefined,
-                status: TaskStatus.TODO
+                priority,
+                durationMinutes,
+                startAt: start,
+                endAt: end,
+                dueAt,
+                planned,
+                status: TaskStatus.TODO,
+                reminder: {
+                    create: reminderCreateData
+                }
+            },
+            include: {
+                reminder: true
             }
+        });
+    }
+
+    static async update(userId: string, taskId: string, data: {
+        title?: string;
+        description?: string;
+        priority?: TaskPriority;
+        durationMinutes?: number;
+        startAt?: string | Date | null;
+        dueAt?: string | Date | null;
+        status?: TaskStatus;
+        reminder?: Partial<TaskReminderInput>;
+    }) {
+        const existing = await prisma.task.findFirst({
+            where: { id: taskId, userId },
+            include: { reminder: true }
+        });
+
+        if (!existing) {
+            throw new Error('Vazifa topilmadi');
+        }
+
+        const updateData: any = {};
+        if (data.title !== undefined) updateData.title = data.title;
+        if (data.description !== undefined) updateData.description = data.description;
+        if (data.priority !== undefined) updateData.priority = data.priority;
+        if (data.durationMinutes !== undefined) updateData.durationMinutes = data.durationMinutes;
+
+        const duration = data.durationMinutes ?? existing.durationMinutes;
+
+        if (data.startAt !== undefined) {
+            if (data.startAt) {
+                const start = new Date(data.startAt);
+                updateData.startAt = start;
+                updateData.endAt = addMinutes(start, duration);
+                updateData.planned = true;
+            } else {
+                updateData.startAt = null;
+                updateData.endAt = null;
+                updateData.planned = false;
+            }
+        }
+
+        if (data.dueAt !== undefined) {
+            updateData.dueAt = data.dueAt ? new Date(data.dueAt) : null;
+        }
+
+        if (data.status !== undefined) {
+            updateData.status = data.status;
+            if (data.status === TaskStatus.DONE && !existing.actualMinutes) {
+                updateData.actualMinutes = duration;
+            }
+        }
+
+        // Apply task updates first
+        const updatedTask = await prisma.task.update({
+            where: { id: taskId },
+            data: updateData
+        });
+
+        // Handle Reminder updates
+        const isNowDone = (data.status === TaskStatus.DONE) || (data.status === undefined && existing.status === TaskStatus.DONE);
+        const effectiveDueAt = data.dueAt !== undefined ? (data.dueAt ? new Date(data.dueAt) : null) : existing.dueAt;
+
+        if (isNowDone) {
+            // Stop reminders immediately
+            if (existing.reminder) {
+                await prisma.reminderSettings.update({
+                    where: { taskId },
+                    data: {
+                        isEnabled: false,
+                        nextReminderAt: null
+                    }
+                });
+            }
+        } else if (data.reminder) {
+            const r = data.reminder;
+            const newReminderType = r.reminderType ?? existing.reminder?.reminderType ?? ReminderType.NONE;
+
+            let nextReminderAt = existing.reminder?.nextReminderAt ?? null;
+            let firstReminderAt = existing.reminder?.firstReminderAt ?? null;
+
+            if (r.firstReminderAt !== undefined) {
+                firstReminderAt = r.firstReminderAt ? new Date(r.firstReminderAt) : null;
+                // If first reminder changed, recalculate next reminder
+                if (firstReminderAt && firstReminderAt > new Date()) {
+                    nextReminderAt = firstReminderAt;
+                }
+            }
+
+            if (r.nextReminderAt !== undefined) {
+                nextReminderAt = r.nextReminderAt ? new Date(r.nextReminderAt) : null;
+            }
+
+            const intervalMinutes = r.intervalMinutes !== undefined ? r.intervalMinutes : existing.reminder?.intervalMinutes;
+
+            let isEnabled = r.isEnabled !== undefined ? r.isEnabled : (existing.reminder?.isEnabled ?? (newReminderType !== ReminderType.NONE));
+            let isPaused = r.isPaused !== undefined ? r.isPaused : (existing.reminder?.isPaused ?? false);
+
+            if (newReminderType === ReminderType.NONE) {
+                isEnabled = false;
+                nextReminderAt = null;
+            } else if (isEnabled && !isPaused && (!nextReminderAt || nextReminderAt <= new Date())) {
+                if (firstReminderAt && firstReminderAt > new Date()) {
+                    nextReminderAt = firstReminderAt;
+                } else if (intervalMinutes) {
+                    nextReminderAt = addMinutes(new Date(), intervalMinutes);
+                } else if (newReminderType === ReminderType.ONCE && updatedTask.startAt && updatedTask.startAt > new Date()) {
+                    nextReminderAt = updatedTask.startAt;
+                }
+            }
+
+            const stopAtDeadline = r.stopAtDeadline !== undefined ? r.stopAtDeadline : (existing.reminder?.stopAtDeadline ?? true);
+            if (stopAtDeadline && effectiveDueAt && nextReminderAt && nextReminderAt > effectiveDueAt) {
+                nextReminderAt = null;
+                isEnabled = false;
+            }
+
+            await prisma.reminderSettings.upsert({
+                where: { taskId },
+                create: {
+                    taskId,
+                    reminderType: newReminderType,
+                    intervalMinutes: intervalMinutes ?? null,
+                    firstReminderAt,
+                    nextReminderAt,
+                    isEnabled,
+                    isPaused,
+                    stopAtDeadline,
+                    maxReminders: r.maxReminders !== undefined ? r.maxReminders : null,
+                    sentCount: 0
+                },
+                update: {
+                    reminderType: newReminderType,
+                    intervalMinutes: intervalMinutes ?? null,
+                    firstReminderAt,
+                    nextReminderAt,
+                    isEnabled,
+                    isPaused,
+                    stopAtDeadline,
+                    maxReminders: r.maxReminders !== undefined ? r.maxReminders : existing.reminder?.maxReminders,
+                    snoozedUntil: r.snoozedUntil !== undefined ? (r.snoozedUntil ? new Date(r.snoozedUntil) : null) : existing.reminder?.snoozedUntil
+                }
+            });
+        } else if (data.status === TaskStatus.TODO && existing.status === TaskStatus.DONE) {
+            // Task was reopened! Re-enable reminder if it had one
+            if (existing.reminder && existing.reminder.reminderType !== ReminderType.NONE) {
+                const interval = existing.reminder.intervalMinutes || 20;
+                await prisma.reminderSettings.update({
+                    where: { taskId },
+                    data: {
+                        isEnabled: true,
+                        isPaused: false,
+                        nextReminderAt: addMinutes(new Date(), interval),
+                        snoozedUntil: null
+                    }
+                });
+            }
+        }
+
+        return prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
+        });
+    }
+
+    static async markDone(userId: string, taskId: string) {
+        const task = await prisma.task.findFirst({
+            where: { id: taskId, userId }
+        });
+        if (!task) throw new Error('Vazifa topilmadi');
+
+        await prisma.task.update({
+            where: { id: taskId },
+            data: {
+                status: TaskStatus.DONE,
+                actualMinutes: task.durationMinutes || 60
+            }
+        });
+
+        // Immediately stop reminders
+        await prisma.reminderSettings.updateMany({
+            where: { taskId },
+            data: {
+                isEnabled: false,
+                nextReminderAt: null
+            }
+        });
+
+        return prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
+        });
+    }
+
+    static async reopen(userId: string, taskId: string) {
+        const task = await prisma.task.findFirst({
+            where: { id: taskId, userId },
+            include: { reminder: true }
+        });
+        if (!task) throw new Error('Vazifa topilmadi');
+
+        await prisma.task.update({
+            where: { id: taskId },
+            data: { status: TaskStatus.TODO }
+        });
+
+        if (task.reminder && task.reminder.reminderType !== ReminderType.NONE) {
+            const interval = task.reminder.intervalMinutes || 20;
+            await prisma.reminderSettings.update({
+                where: { taskId },
+                data: {
+                    isEnabled: true,
+                    isPaused: false,
+                    nextReminderAt: addMinutes(new Date(), interval),
+                    snoozedUntil: null
+                }
+            });
+        }
+
+        return prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
+        });
+    }
+
+    static async updateReminderControl(userId: string, taskId: string, action: {
+        type: 'pause' | 'resume' | 'snooze' | 'disable' | 'enable' | 'set_interval' | 'set_next_time';
+        minutes?: number;
+        nextTime?: string | Date;
+    }) {
+        const task = await prisma.task.findFirst({
+            where: { id: taskId, userId },
+            include: { reminder: true }
+        });
+        if (!task) throw new Error('Vazifa topilmadi');
+
+        let reminder = task.reminder;
+        if (!reminder) {
+            reminder = await prisma.reminderSettings.create({
+                data: {
+                    taskId,
+                    reminderType: ReminderType.REPEATED,
+                    intervalMinutes: 20,
+                    isEnabled: true,
+                    isPaused: false
+                }
+            });
+        }
+
+        const now = new Date();
+        const updateData: any = {};
+
+        switch (action.type) {
+            case 'pause':
+                updateData.isPaused = true;
+                break;
+            case 'resume':
+                updateData.isPaused = false;
+                updateData.isEnabled = true;
+                updateData.nextReminderAt = addMinutes(now, reminder.intervalMinutes || 20);
+                updateData.snoozedUntil = null;
+                break;
+            case 'snooze':
+                const snoozeMins = action.minutes || 20;
+                const snoozeTarget = addMinutes(now, snoozeMins);
+                updateData.snoozedUntil = snoozeTarget;
+                updateData.nextReminderAt = snoozeTarget;
+                updateData.isEnabled = true;
+                updateData.isPaused = false;
+                break;
+            case 'disable':
+                updateData.isEnabled = false;
+                updateData.nextReminderAt = null;
+                break;
+            case 'enable':
+                updateData.isEnabled = true;
+                updateData.isPaused = false;
+                updateData.nextReminderAt = addMinutes(now, reminder.intervalMinutes || 20);
+                break;
+            case 'set_interval':
+                if (action.minutes && action.minutes > 0) {
+                    updateData.intervalMinutes = action.minutes;
+                    if (reminder.isEnabled && !reminder.isPaused) {
+                        updateData.nextReminderAt = addMinutes(now, action.minutes);
+                    }
+                }
+                break;
+            case 'set_next_time':
+                if (action.nextTime) {
+                    updateData.nextReminderAt = new Date(action.nextTime);
+                    updateData.isEnabled = true;
+                }
+                break;
+        }
+
+        await prisma.reminderSettings.update({
+            where: { id: reminder.id },
+            data: updateData
+        });
+
+        return prisma.task.findUnique({
+            where: { id: taskId },
+            include: { reminder: true }
         });
     }
 
@@ -58,7 +426,7 @@ export class TaskService {
                 userId,
                 planned: true,
                 id: excludeTaskId ? { not: excludeTaskId } : undefined,
-                status: { not: TaskStatus.DONE }, // Optional: Decide if DONE tasks block slots. Usually yes for history, but maybe not for re-planning. Let's assume YES for now.
+                status: { not: TaskStatus.DONE },
                 AND: [
                     { startAt: { lt: end } },
                     { endAt: { gt: start } }
@@ -81,7 +449,7 @@ export class TaskService {
                 userId,
                 planned: true,
                 startAt: { gte: workStart, lt: workEnd },
-                status: { not: TaskStatus.DONE } // Only active tasks block slots? Or handled tasks too? Let's check all planned tasks.
+                status: { not: TaskStatus.DONE }
             },
             orderBy: { startAt: 'asc' }
         });
@@ -91,7 +459,6 @@ export class TaskService {
 
         for (const task of tasks) {
             if (!task.startAt) continue;
-            // Check gap between lastEnd and task.startAt
             const gapDuration = (task.startAt.getTime() - lastEnd.getTime()) / (1000 * 60);
             if (gapDuration >= 60) {
                 gaps.push({ start: lastEnd, end: task.startAt, duration: gapDuration });
@@ -101,7 +468,6 @@ export class TaskService {
             }
         }
 
-        // Check final gap
         const finalGapDuration = (workEnd.getTime() - lastEnd.getTime()) / (1000 * 60);
         if (finalGapDuration >= 60) {
             gaps.push({ start: lastEnd, end: workEnd, duration: finalGapDuration });
@@ -111,25 +477,16 @@ export class TaskService {
     }
 
     static async autoPlan(userId: string, date: Date) {
-        // 1. Get Gaps
         const gaps = await this.getWorkGaps(userId, date);
 
-        // 2. Get Backlog tasks sorted by priority
         const backlog = await prisma.task.findMany({
             where: {
                 userId,
                 planned: false,
                 status: TaskStatus.TODO
-            },
-            orderBy: [
-                { priority: 'asc' }, // IMPORTANT (enum order might need verification, usually alphabetically. We need custom sort if Enum isn't ordered correctly)
-                // Prisma Enums are strings. We need to handle Priority carefully.
-                // Let's assume we map them or fetch all and sort in JS if needed.
-                // Actually, let's just fetch and sort in memory for robust priority logic: IMPORTANT > NORMAL > FUTURE
-            ]
+            }
         });
 
-        // Sort backlog manually to be safe
         const priorityOrder = { [TaskPriority.IMPORTANT]: 0, [TaskPriority.NORMAL]: 1, [TaskPriority.FUTURE]: 2 };
         backlog.sort((a: Task, b: Task) => priorityOrder[a.priority] - priorityOrder[b.priority]);
 
@@ -138,7 +495,6 @@ export class TaskService {
         for (const task of backlog) {
             for (const gap of gaps) {
                 if (gap.duration >= task.durationMinutes) {
-                    // Fit it in!
                     const newStart = gap.start;
                     const newEnd = addMinutes(newStart, task.durationMinutes);
 
@@ -152,11 +508,9 @@ export class TaskService {
                     });
 
                     plannedTasks.push(task);
-
-                    // Update gap (conceptually, we just consumed start of it. simplest is to re-calc gaps or just adjust local gap var)
                     gap.start = newEnd;
                     gap.duration -= task.durationMinutes;
-                    break; // Move to next task
+                    break;
                 }
             }
         }
