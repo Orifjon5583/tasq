@@ -29,7 +29,7 @@ app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
 app.register(cors, {
-    origin: env.FRONTEND_URL ? [env.FRONTEND_URL, 'http://localhost:3000'] : '*',
+    origin: true,
 });
 
 app.register(jwt, {
