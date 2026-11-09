@@ -21,6 +21,15 @@ const env = envSchema.parse(process.env);
 
 export const prisma = new PrismaClient();
 
+import { authRoutes } from './routes/auth';
+import { taskRoutes } from './routes/tasks';
+import { financeRoutes } from './routes/finance';
+import { analyticsRoutes } from './routes/analytics';
+import { savedLinkRoutes } from './routes/savedLinks';
+import { eventRoutes } from './routes/events';
+import { launchBot } from './bot';
+import { SchedulerService } from './services/schedulerService';
+
 const app = Fastify({
     logger: true,
 }).withTypeProvider<ZodTypeProvider>();
@@ -54,16 +63,6 @@ app.register(eventRoutes, { prefix: '/api/events' });
 app.get('/health', async () => {
     return { status: 'ok', timestamp: new Date() };
 });
-
-// Init Bot and Scheduler
-import { launchBot } from './bot';
-import { SchedulerService } from './services/schedulerService';
-import { authRoutes } from './routes/auth';
-import { taskRoutes } from './routes/tasks';
-import { financeRoutes } from './routes/finance';
-import { analyticsRoutes } from './routes/analytics';
-import { savedLinkRoutes } from './routes/savedLinks';
-import { eventRoutes } from './routes/events';
 
 const start = async () => {
     try {
