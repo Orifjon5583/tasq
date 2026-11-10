@@ -1,6 +1,9 @@
 import { PrismaClient, Task, TaskPriority, TaskStatus, ReminderType } from '@prisma/client';
 import { prisma } from '../app';
 import { startOfDay, endOfDay, addMinutes, isBefore, isAfter } from 'date-fns';
+import { bot } from '../bot/instance';
+import { formatInTashkent } from './schedulerService';
+import { Markup } from 'telegraf';
 
 export interface TaskReminderInput {
     reminderType: ReminderType;
@@ -94,7 +97,7 @@ export class TaskService {
             };
         }
 
-        return prisma.task.create({
+        const createdTask = await prisma.task.create({
             data: {
                 userId,
                 title: data.title,
@@ -111,9 +114,54 @@ export class TaskService {
                 }
             },
             include: {
-                reminder: true
+                reminder: true,
+                user: true
             }
         });
+
+        // Instant notification to Telegram if user account is linked
+        if (createdTask.user && createdTask.user.telegramChatId && createdTask.user.allowReminders) {
+            try {
+                const startTimeStr = createdTask.startAt ? formatInTashkent(createdTask.startAt, true) : 'Belgilanmagan';
+                const dueTimeStr = createdTask.dueAt ? formatInTashkent(createdTask.dueAt, true) : 'Belgilanmagan';
+                let reminderInfo = 'Yo‘q';
+                if (createdTask.reminder && createdTask.reminder.reminderType !== ReminderType.NONE) {
+                    if (createdTask.reminder.reminderType === ReminderType.ONCE) {
+                        reminderInfo = 'Bir martalik';
+                    } else {
+                        reminderInfo = `Har ${createdTask.reminder.intervalMinutes || 20} daqiqada`;
+                    }
+                }
+
+                const msg =
+                    `📝 **Saytdan yangi vazifa qo‘shildi!**\n\n` +
+                    `📋 **Vazifa**: ${createdTask.title}\n` +
+                    (createdTask.description ? `📝 **Tavsif**: ${createdTask.description}\n` : '') +
+                    `🕒 **Boshlanish**: ${startTimeStr}\n` +
+                    `⏳ **Muddat (Deadline)**: ${dueTimeStr}\n` +
+                    `🔄 **Eslatma**: ${reminderInfo}\n\n` +
+                    `_Eslatma vaqti kelganda bot sizga bildirishnoma yuboradi._`;
+
+                const appBaseUrl = process.env.APP_BASE_URL || 'https://personal.orifdev.uz';
+                const openTaskButton = appBaseUrl.startsWith('https://')
+                    ? Markup.button.url('📋 Vazifani ochish', `${appBaseUrl}/dashboard/tasks?id=${createdTask.id}`)
+                    : Markup.button.callback('📋 Vazifani ochish', `reminder:open:${createdTask.id}`);
+
+                await bot.telegram.sendMessage(createdTask.user.telegramChatId, msg, {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [
+                            Markup.button.callback('✅ Bajarildi deb belgilash', `reminder:done:${createdTask.id}`),
+                            openTaskButton
+                        ]
+                    ])
+                });
+            } catch (notifyErr) {
+                console.error('Failed to send task creation notification to Telegram:', notifyErr);
+            }
+        }
+
+        return createdTask;
     }
 
     static async update(userId: string, taskId: string, data: {

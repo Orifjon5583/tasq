@@ -36,12 +36,19 @@ bot.start(async (ctx) => {
         user = await prisma.user.findUnique({ where: { telegramChatId: chatId } });
     }
 
-    // 3. Fallback: if only one demo user exists and no chat ID linked yet
+    // 3. Fallback: if user with tasks exists or active user
     if (!user) {
-        const singleUser = await prisma.user.findFirst();
-        if (singleUser && !singleUser.telegramChatId) {
+        const userWithTasks = await prisma.user.findFirst({
+            where: { tasks: { some: {} } },
+            orderBy: { updatedAt: 'desc' }
+        });
+        if (userWithTasks) {
+            await prisma.user.updateMany({
+                where: { telegramChatId: chatId, id: { not: userWithTasks.id } },
+                data: { telegramChatId: null }
+            });
             user = await prisma.user.update({
-                where: { id: singleUser.id },
+                where: { id: userWithTasks.id },
                 data: { telegramChatId: chatId }
             });
         }
@@ -54,8 +61,11 @@ bot.start(async (ctx) => {
         `👋 **Assalomu alaykum, ${user ? user.name : 'Foydalanuvchi'}!**\n\n` +
         `🆔 **Sizning Telegram Chat ID:** \`${chatId}\`\n\n` +
         (user
-            ? `✅ **Hisob holati**: Sayt hisobingizga muvaffaqiyatli bog‘landi!\n\n`
-            : `⚠️ **Hisob holati**: Sayt bilan bog‘lanmagan. Ushbu Chat ID ni saytdagi profilingizga kiriting yoki saytdan "Botni Ulash" tugmasini bosing.\n\n`) +
+            ? `✅ **Hisob holati**: Sayt hisobingizga muvaffaqiyatli bog‘landi! (${user.name} - ${user.email})\n\n`
+            : `⚠️ **Hisob holati**: Sayt bilan bog‘lanmagan.\n\n` +
+              `🔗 **Tezkor bog‘lash uchun:**\n` +
+              `Botga \`/link sizning_emailingiz\` deb yuboring (Masalan: \`/link user@gmail.com\`).\n` +
+              `Yoki saytdagi profilingizga ushbu Chat ID ni kiriting.\n\n`) +
         `⚙️ **Sozlamalar holati:**\n` +
         `🔔 **Eslatma yuborish:** ${allowReminders ? '🟢 FAOL (Eslatmalar yuboriladi)' : '🔴 O‘CHIRILGAN (Eslatma yuborilmaydi)'}\n` +
         `🎓 **Dars rejimi:** ${lessonMode ? '🟢 FAOL (Dars paytida bezovta qilinmaydi)' : '⚪ NOFAOL (Oddiy rejim)'}\n\n` +
@@ -235,7 +245,8 @@ import './commands'; // Import commands to register them
 
 export const launchBot = () => {
     bot.telegram.setMyCommands([
-        { command: 'today', description: 'Bugungi vazifalar' },
+        { command: 'today', description: 'Barcha faol vazifalar' },
+        { command: 'link', description: 'Sayt hisobiga bog‘lash (/link email)' },
         { command: 'dars', description: 'Dars rejimi (Yoqish / O‘chirish)' },
         { command: 'add', description: 'Tezkor vazifa qo‘shish' },
         { command: 'plan', description: 'Kunni avtomatik rejalashtirish' },

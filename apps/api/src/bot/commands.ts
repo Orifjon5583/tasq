@@ -10,15 +10,23 @@ import { TaskPriority, TaskStatus } from '@prisma/client';
 import { addMinutes, format } from 'date-fns';
 
 // Extract user ID helper
-const getUserId = async (ctx: Context) => {
+export const getUserId = async (ctx: Context) => {
     const chatId = ctx.chat?.id.toString();
     if (!chatId) return null;
     let user = await prisma.user.findUnique({ where: { telegramChatId: chatId } });
-    if (!user && chatId === '6711922793') {
-        user = await prisma.user.findFirst();
-        if (user) {
-            await prisma.user.update({
-                where: { id: user.id },
+    if (!user) {
+        // Fallback: if only one user with tasks exists or latest active user
+        const userWithTasks = await prisma.user.findFirst({
+            where: { tasks: { some: {} } },
+            orderBy: { updatedAt: 'desc' }
+        });
+        if (userWithTasks) {
+            await prisma.user.updateMany({
+                where: { telegramChatId: chatId, id: { not: userWithTasks.id } },
+                data: { telegramChatId: null }
+            });
+            user = await prisma.user.update({
+                where: { id: userWithTasks.id },
                 data: { telegramChatId: chatId }
             });
         }
@@ -26,45 +34,105 @@ const getUserId = async (ctx: Context) => {
     return user?.id;
 };
 
-// /today
-bot.command('today', async (ctx) => {
+// Shared helper to send today's and active tasks
+export const sendTodayTasks = async (ctx: Context) => {
     const userId = await getUserId(ctx);
-    if (!userId) return ctx.reply('⚠️ Hisobingiz bog‘lanmagan. Web dashboard orqali kodni oling va botga yuboring.');
+    if (!userId) {
+        return ctx.reply('⚠️ Hisobingiz sayt bilan bog‘lanmagan.\n\nBog‘lash uchun botga: `/link sizning_emailingiz` deb yozing (Masalan: `/link user@gmail.com`).', { parse_mode: 'Markdown' });
+    }
 
     const today = new Date();
     const startOfToday = new Date(today.setHours(0, 0, 0, 0));
     const endOfToday = new Date(today.setHours(23, 59, 59, 999));
 
-    const tasks = await prisma.task.findMany({
+    // 1. Bugungi rejalashtirilgan vazifalar
+    const todayTasks = await prisma.task.findMany({
         where: {
             userId,
             planned: true,
             startAt: { gte: startOfToday, lte: endOfToday }
         },
+        include: { reminder: true },
         orderBy: { startAt: 'asc' }
     });
 
-    const backlog = await prisma.task.findMany({
-        where: { userId, status: TaskStatus.TODO, priority: TaskPriority.IMPORTANT, planned: false }
+    // 2. Barcha boshqa faol (bajarilmagan) vazifalar
+    const otherTasks = await prisma.task.findMany({
+        where: {
+            userId,
+            status: { not: TaskStatus.DONE },
+            id: { notIn: todayTasks.map(t => t.id) }
+        },
+        include: { reminder: true },
+        orderBy: { createdAt: 'desc' }
     });
 
-    let msg = `📅 **Bugungi Reja**:\n`;
-    if (tasks.length === 0) msg += `(Rejalashtirilgan ishlar yo‘q)\n`;
+    if (todayTasks.length === 0 && otherTasks.length === 0) {
+        return ctx.reply('📋 **Vazifalar ro‘yxati**:\n\n(Hozircha faol vazifalar yo‘q. Saytdan yoki /add orqali yangi vazifa qo‘shishingiz mumkin)');
+    }
 
-    tasks.forEach((t: any) => {
-        const time = t.startAt ? formatInTashkent(t.startAt) : '??:??';
-        const icon = t.status === TaskStatus.DONE ? '✅' : t.priority === TaskPriority.IMPORTANT ? '🔴' : t.priority === TaskPriority.NORMAL ? '🟠' : '🔵';
-        msg += `${icon} ${time} - ${t.title} (${t.durationMinutes}m)\n`;
-    });
+    let msg = `📋 **Sizning Vazifalaringiz**:\n\n`;
 
-    if (backlog.length > 0) {
-        msg += `\n📌 **Muhim (Rejasiz)**:\n`;
-        backlog.forEach((t: any) => {
-            msg += `🔴 ${t.title} (/plan qiling)\n`;
+    if (todayTasks.length > 0) {
+        msg += `📅 **Bugungi Reja**:\n`;
+        todayTasks.forEach((t: any) => {
+            const time = t.startAt ? formatInTashkent(t.startAt) : '??:??';
+            const icon = t.status === TaskStatus.DONE ? '✅' : t.priority === TaskPriority.IMPORTANT ? '🔴' : t.priority === TaskPriority.NORMAL ? '🟠' : '🔵';
+            const reminderInfo = t.reminder && t.reminder.isEnabled ? ' 🔔' : '';
+            msg += `${icon} ${time} - ${t.title} (${t.durationMinutes}m)${reminderInfo}\n`;
+        });
+        msg += `\n`;
+    }
+
+    if (otherTasks.length > 0) {
+        msg += `📌 **Barcha Boshqa Faol Vazifalar**:\n`;
+        otherTasks.forEach((t: any) => {
+            const icon = t.priority === TaskPriority.IMPORTANT ? '🔴' : t.priority === TaskPriority.NORMAL ? '🟠' : '🔵';
+            const timeStr = t.startAt ? ` (${formatInTashkent(t.startAt, true)})` : t.dueAt ? ` (Muddat: ${formatInTashkent(t.dueAt, true)})` : '';
+            const reminderInfo = t.reminder && t.reminder.isEnabled ? ' 🔔' : '';
+            msg += `${icon} ${t.title}${timeStr}${reminderInfo}\n`;
         });
     }
 
-    ctx.replyWithMarkdown(msg);
+    await ctx.replyWithMarkdown(msg);
+};
+
+// /today
+bot.command('today', sendTodayTasks);
+
+// /link <email> - Instant account linking command
+bot.command('link', async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    const text = ctx.message.text.trim();
+    const parts = text.split(/\s+/);
+    if (parts.length < 2) {
+        return ctx.reply('⚠️ Iltimos, emailingizni kiriting:\nMasalan: `/link user@gmail.com`', { parse_mode: 'Markdown' });
+    }
+    const email = parts[1].toLowerCase().trim();
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+        return ctx.reply(`❌ Saytda bunday email (${email}) topilmadi.\nAvval https://personal.orifdev.uz saytida ro‘yxatdan o‘ting.`);
+    }
+
+    // Detach chatId from other users if attached
+    await prisma.user.updateMany({
+        where: { telegramChatId: chatId, id: { not: user.id } },
+        data: { telegramChatId: null }
+    });
+
+    // Attach to this user
+    await prisma.user.update({
+        where: { id: user.id },
+        data: { telegramChatId: chatId }
+    });
+
+    return ctx.reply(
+        `✅ **Hisob muvaffaqiyatli bog‘landi!**\n\n` +
+        `👤 **Foydalanuvchi**: ${user.name} (${user.email})\n` +
+        `🆔 **Chat ID**: \`${chatId}\`\n\n` +
+        `Endi saytdan reja yoki vazifa qo‘shganingizda, darhol botda ko‘rinadi va eslatmalar keladi!`,
+        { parse_mode: 'Markdown' }
+    );
 });
 
 // /plan
@@ -466,35 +534,12 @@ bot.hears('💰 Qolgan mablag‘', async (ctx) => {
     }
 });
 
-bot.hears('📋 Vazifalar', async (ctx) => {
-    const userId = await getUserId(ctx);
-    if (!userId) return ctx.reply('⚠️ Hisobingiz bog‘lanmagan.');
-
-    const today = new Date();
-    const startOfToday = new Date(today.setHours(0, 0, 0, 0));
-    const endOfToday = new Date(today.setHours(23, 59, 59, 999));
-
-    const tasks = await prisma.task.findMany({
-        where: {
-            userId,
-            planned: true,
-            startAt: { gte: startOfToday, lte: endOfToday }
-        },
-        orderBy: { startAt: 'asc' }
-    });
-
-    let msg = `📅 **Bugungi Reja**:\n`;
-    if (tasks.length === 0) {
-        msg += `(Rejalashtirilgan ishlar yo‘q)`;
-    } else {
-        tasks.forEach((t: any) => {
-            const time = t.startAt ? formatInTashkent(t.startAt) : '??:??';
-            const icon = t.status === TaskStatus.DONE ? '✅' : t.priority === TaskPriority.IMPORTANT ? '🔴' : t.priority === TaskPriority.NORMAL ? '🟠' : '🔵';
-            msg += `${icon} ${time} - ${t.title} (${t.durationMinutes}m)\n`;
-        });
-    }
-
-    ctx.replyWithMarkdown(msg);
+bot.hears('📋 Vazifalar', sendTodayTasks);
+bot.action('bot:today_tasks', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+    } catch {}
+    await sendTodayTasks(ctx);
 });
 
 bot.hears('✅ Topshirilgan', async (ctx) => {

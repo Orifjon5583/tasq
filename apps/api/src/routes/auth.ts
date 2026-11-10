@@ -106,7 +106,17 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
 
         const data: any = {};
         if (name !== undefined) data.name = name;
-        if (telegramChatId !== undefined) data.telegramChatId = telegramChatId ? telegramChatId.trim() : null;
+        if (telegramChatId !== undefined) {
+            const cleanId = telegramChatId ? telegramChatId.trim() : null;
+            if (cleanId) {
+                // Detach from any other user to prevent unique constraint error
+                await prisma.user.updateMany({
+                    where: { telegramChatId: cleanId, id: { not: request.user.id } },
+                    data: { telegramChatId: null }
+                });
+            }
+            data.telegramChatId = cleanId;
+        }
         if (allowReminders !== undefined) data.allowReminders = allowReminders;
         if (lessonMode !== undefined) data.lessonMode = lessonMode;
 
@@ -142,10 +152,10 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
         try {
             botInfo = await bot.telegram.getMe();
         } catch {
-            botInfo = { username: 'tasq_robot' };
+            botInfo = { username: 'RejaBotUzBOT' };
         }
 
-        const username = botInfo?.username || 'tasq_robot';
+        const username = botInfo?.username || 'RejaBotUzBOT';
         const deepLink = `https://t.me/${username}?start=${code}`;
 
         return {
